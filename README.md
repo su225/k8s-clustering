@@ -1,2 +1,2 @@
 # k8s-clustering
-Clustering in Kubernetes
+This is a simple project to demonstrate the cluster-formation on Kubernetes.
