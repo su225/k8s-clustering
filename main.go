@@ -54,6 +54,7 @@ func (ctx *ServiceContext) Start(stopSignal chan<- os.Signal) {
 	logrus.Infof("starting kubernetes clustering provider for raft")
 	if err := ctx.setupKubernetesClientset(); err != nil {
 		stopSignal <- syscall.SIGABRT
+		return
 	}
 	ctx.startHTTPServer(stopSignal)
 }
@@ -63,12 +64,12 @@ func (ctx *ServiceContext) Start(stopSignal chan<- os.Signal) {
 func (ctx *ServiceContext) setupKubernetesClientset() error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		logrus.Errorf("error while setting up K8S in-cluster client config")
+		logrus.Errorf("error while setting up K8S in-cluster client config. Reason=%s", err.Error())
 		return err
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		logrus.Errorf("error while getting k8s clientset")
+		logrus.Errorf("error while getting k8s clientset. Reason=%s", err.Error())
 		return err
 	}
 	ctx.Clientset = clientset
@@ -144,11 +145,13 @@ func (ctx *ServiceContext) getNodesWithLabel(w http.ResponseWriter, r *http.Requ
 // Destroy shuts down the components in ServiceContext gracefully
 func (ctx *ServiceContext) Destroy() {
 	logrus.Infof("destroying the kubernetes clustering provider")
-	shutdownCtx, cancelFunc := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelFunc()
-	if err := ctx.Server.Shutdown(shutdownCtx); err != nil {
-		logrus.Errorf("error while shutting down discovery server. Reason=%s", err.Error())
-		return
+	if ctx.Server != nil {
+		shutdownCtx, cancelFunc := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelFunc()
+		if err := ctx.Server.Shutdown(shutdownCtx); err != nil {
+			logrus.Errorf("error while shutting down discovery server. Reason=%s", err.Error())
+			return
+		}
 	}
 }
 
