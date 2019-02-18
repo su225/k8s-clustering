@@ -23,7 +23,14 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -33,61 +40,133 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// MemberPod represents the pod which is the member
-// of the cluster to which this node belongs
-type MemberPod struct {
-	PodName      string            `json:"pod_name"`
-	PodNamespace string            `json:"pod_ns"`
-	Labels       map[string]string `json:"labels"`
+// ServiceContext holds all the objects required for this
+// service to work properly.
+type ServiceContext struct {
+	Port uint64
+	*http.Server
+	*kubernetes.Clientset
+}
+
+// Start starts the components of the ServiceContext and if
+// there is any error then the node shuts down gracefully
+func (ctx *ServiceContext) Start(stopSignal chan<- os.Signal) {
+	logrus.Infof("starting kubernetes clustering provider for raft")
+	if err := ctx.setupKubernetesClientset(); err != nil {
+		stopSignal <- syscall.SIGABRT
+	}
+	ctx.startHTTPServer(stopSignal)
+}
+
+// setupKubernetesClientset sets up kubernetes client set and
+// returns error if there is any
+func (ctx *ServiceContext) setupKubernetesClientset() error {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		logrus.Errorf("error while setting up K8S in-cluster client config")
+		return err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		logrus.Errorf("error while getting k8s clientset")
+		return err
+	}
+	ctx.Clientset = clientset
+	return nil
+}
+
+// startHTTPServer starts the HTTP server at the specified port
+func (ctx *ServiceContext) startHTTPServer(stopSignal chan<- os.Signal) {
+	ctx.Server = &http.Server{
+		Addr:    fmt.Sprintf(":%d", ctx.Port),
+		Handler: ctx.setupHTTPServerRoutes(),
+	}
+	go func() {
+		logrus.Infof("starting discovery server at port %d", ctx.Port)
+		if err := ctx.Server.ListenAndServe(); err != http.ErrServerClosed {
+			logrus.Errorf("error while serving. Reason=%s", err.Error())
+			stopSignal <- syscall.SIGABRT
+		}
+	}()
+}
+
+// setupHTTPServerRoutes sets up the HTTP server routes
+func (ctx *ServiceContext) setupHTTPServerRoutes() *mux.Router {
+	r := mux.NewRouter()
+	r.HandleFunc("/v1/nodes/{ns}/{label}", ctx.getNodesWithLabel)
+	return r
+}
+
+// getNodesWithLabel returns all nodes with the given label in the given namespace.
+// If successful then the list containing node names is returned with status OK. If
+// one of namespace or label is missing then status Bad Request is returned. If there
+// is any error while retrieving or marshaling the response then status Internal
+// Server Error is returned.
+func (ctx *ServiceContext) getNodesWithLabel(w http.ResponseWriter, r *http.Request) {
+	ns, nsPresent := mux.Vars(r)["ns"]
+	label, labelPresent := mux.Vars(r)["label"]
+
+	if !nsPresent || !labelPresent {
+		errMsg := "label and namespace must be present"
+		logrus.Errorf("[%s] %s", r.RemoteAddr, errMsg)
+		w.Write([]byte(errMsg))
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	logrus.Infof("[%s] received getNodes request. label=%s, ns=%s", r.RemoteAddr, ns, label)
+	podlist, err := ctx.Clientset.CoreV1().Pods(ns).List(metav1.ListOptions{LabelSelector: label})
+	if err != nil {
+		logrus.Errorf("[%s] error while retrieving pods (ns=%s,label=%s). Reason=%s",
+			r.RemoteAddr, ns, label, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	// Get the podnames and return the same
+	// or return marshaling error if it occurs
+	podnames := make([]string, 0)
+	for _, pod := range podlist.Items {
+		podnames = append(podnames, pod.ObjectMeta.GetName())
+	}
+	marshaled, err := json.Marshal(podnames)
+	if err != nil {
+		logrus.Errorf("[%s] error while marshaling podnames. Reason=%s", r.RemoteAddr, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(marshaled)
+}
+
+// Destroy shuts down the components in ServiceContext gracefully
+func (ctx *ServiceContext) Destroy() {
+	logrus.Infof("destroying the kubernetes clustering provider")
+	shutdownCtx, cancelFunc := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFunc()
+	if err := ctx.Server.Shutdown(shutdownCtx); err != nil {
+		logrus.Errorf("error while shutting down discovery server. Reason=%s", err.Error())
+		return
+	}
 }
 
 func main() {
-	go setupKubernetesListener()
-	launchHTTPServer()
-}
+	port := flag.Uint64("port", 8080, "port in which the service listens")
+	flag.Parse()
 
-func launchHTTPServer() {
-	r := mux.NewRouter()
-	r.HandleFunc("/peers", getPeers).Methods("GET")
-	r.HandleFunc("/peers/reachable", getReachableNodes).Methods("GET")
-	if err := http.ListenAndServe(":8080", r); err != nil {
-		logrus.Errorf("error while launching HTTP server (reason=%s)", err.Error())
-		return
-	}
-}
+	svcContext := &ServiceContext{Port: *port}
 
-func setupKubernetesListener() {
-	k8sconfig, err := rest.InClusterConfig()
-	if err != nil {
-		logrus.Errorf("error while obtaining kubernetes-configuration (reason=%s)", err)
-		return
-	}
-	clientset, err := kubernetes.NewForConfig(k8sconfig)
-	if err != nil {
-		logrus.Errorf("error while creating clientset (reason=%s)", clientset)
-	}
-	for {
-		pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
-		if err != nil {
-			logrus.Errorf("error while querying pods (reason=%s)", err.Error())
-			continue
-		}
-		logrus.Infof("there are %d pods in the cluster", len(pods.Items))
-		for _, pod := range pods.Items {
-			logrus.Infof("pod %s/%s has labels %v",
-				pod.GetNamespace(),
-				pod.GetName(),
-				pod.GetLabels())
-		}
-		<-time.After(10 * time.Second)
-	}
-}
+	gracefulStop := make(chan os.Signal)
+	signal.Notify(gracefulStop, syscall.SIGABRT)
+	signal.Notify(gracefulStop, syscall.SIGTERM)
+	signal.Notify(gracefulStop, syscall.SIGHUP)
 
-// getPeers returns all the peers known to this node in the cluster
-func getPeers(w http.ResponseWriter, r *http.Request) {
-	logrus.Infof("received GET /peers request from %s", r.RemoteAddr)
-}
+	go svcContext.Start(gracefulStop)
 
-func getReachableNodes(w http.ResponseWriter, r *http.Request) {
-	logrus.Infof("received GET /peers/reachable request from %s", r.RemoteAddr)
+	<-gracefulStop
+	logrus.Infof("received signal %d", gracefulStop)
+	logrus.Infof("initiate graceful shutdown")
+	svcContext.Destroy()
 }
