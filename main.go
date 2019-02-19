@@ -36,6 +36,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -116,7 +117,9 @@ func (ctx *ServiceContext) getNodesWithLabel(w http.ResponseWriter, r *http.Requ
 	}
 
 	logrus.Infof("[%s] received getNodes request. label=%s, ns=%s", r.RemoteAddr, ns, label)
-	podlist, err := ctx.Clientset.CoreV1().Pods(ns).List(metav1.ListOptions{LabelSelector: label})
+	queryLabelSet := labels.Set(map[string]string{"app": label})
+	logrus.Debugf("[%s] label selector: %s", r.RemoteAddr, queryLabelSet.AsSelector().String())
+	podlist, err := ctx.Clientset.CoreV1().Pods(ns).List(metav1.ListOptions{LabelSelector: queryLabelSet.AsSelector().String()})
 	if err != nil {
 		logrus.Errorf("[%s] error while retrieving pods (ns=%s,label=%s). Reason=%s",
 			r.RemoteAddr, ns, label, err.Error())
@@ -129,6 +132,7 @@ func (ctx *ServiceContext) getNodesWithLabel(w http.ResponseWriter, r *http.Requ
 	// or return marshaling error if it occurs
 	podnames := make([]string, 0)
 	for _, pod := range podlist.Items {
+		logrus.Debugf("retrieved pod: %s", pod.ObjectMeta.GetName())
 		podnames = append(podnames, pod.ObjectMeta.GetName())
 	}
 	marshaled, err := json.Marshal(podnames)
@@ -156,6 +160,8 @@ func (ctx *ServiceContext) Destroy() {
 }
 
 func main() {
+	logrus.SetLevel(logrus.DebugLevel)
+
 	port := flag.Uint64("port", 8888, "port in which the service listens")
 	flag.Parse()
 
