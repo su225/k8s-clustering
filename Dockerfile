@@ -22,4 +22,4 @@ USER nodeuser
 # Copy the binary and launch it on port 8080
 COPY --from=build /go/src/github.com/su225/k8s-clustering/k8s-clustering /node
 CMD /node/k8s-clustering
-EXPOSE 8080
+EXPOSE 8888
