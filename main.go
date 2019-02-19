@@ -156,7 +156,7 @@ func (ctx *ServiceContext) Destroy() {
 }
 
 func main() {
-	port := flag.Uint64("port", 8080, "port in which the service listens")
+	port := flag.Uint64("port", 8888, "port in which the service listens")
 	flag.Parse()
 
 	svcContext := &ServiceContext{Port: *port}
